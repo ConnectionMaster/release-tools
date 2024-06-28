@@ -35,7 +35,7 @@ class Build:
     def __eq__(self, other):
         return self.id == other.id
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.id)
 
 
@@ -52,9 +52,7 @@ class BuildBotAPI:
         async with self._session.get(url) as resp:
             return await resp.text()
 
-    async def _fetch_json(
-        self, url: str
-    ) -> Dict[
+    async def _fetch_json(self, url: str) -> Dict[
         str,
         Union[
             List[Dict[str, Union[int, bool, str]]],
@@ -110,7 +108,7 @@ class BuildBotAPI:
         )
         return build
 
-    async def get_recent_failures(self, limit=100):
+    async def get_recent_failures(self, limit: int = 100) -> set[Build]:
         data = await self._fetch_json(
             f"https://buildbot.python.org/all/api/v2/builds?"
             f"complete__eq=true&&results__eq=2&&"

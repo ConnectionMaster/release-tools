@@ -4,6 +4,7 @@
 
 Original code by Pablo Galindo
 """
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -11,7 +12,6 @@ import builtins
 import contextlib
 import functools
 import getpass
-import itertools
 import json
 import os
 import pathlib
@@ -19,13 +19,12 @@ import re
 import shelve
 import shutil
 import subprocess
-import tempfile
+import sys
 import time
 import urllib.request
-import sys
 from dataclasses import dataclass
 from shelve import DbfilenameShelf
-from typing import Callable, Iterator, List, Optional, final
+from typing import Any, Callable, Generator, Iterator
 
 import aiohttp
 import gnupg
@@ -34,8 +33,8 @@ import sigstore.oidc
 from alive_progress import alive_bar
 
 import release as release_mod
-from buildbotapi import BuildBotAPI
 import sbom
+from buildbotapi import BuildBotAPI, Builder
 
 API_KEY_REGEXP = re.compile(r"(?P<major>\w+):(?P<minor>\w+)")
 
@@ -186,7 +185,7 @@ class Task:
     function: Callable[[DbfilenameShelf], None]
     description: str
 
-    def __call__(self, db: DbfilenameShelf) -> None:
+    def __call__(self, db: DbfilenameShelf) -> Any:
         return getattr(self, "function")(db)
 
 
@@ -197,13 +196,13 @@ class ReleaseException(Exception):
 class ReleaseDriver:
     def __init__(
         self,
-        tasks: List[Task],
+        tasks: list[Task],
         *,
         release_tag: release_mod.Tag,
         git_repo: str,
         api_key: str,
         ssh_user: str,
-        first_state: Optional[Task] = None,
+        first_state: Task | None = None,
     ) -> None:
         self.tasks = tasks
         dbfile = pathlib.Path.home() / ".python_release"
@@ -214,7 +213,7 @@ class ReleaseDriver:
             self.db.close()
             self.db = shelve.open(str(dbfile), "n")
 
-        self.current_task: Optional[Task] = first_state
+        self.current_task: Task | None = first_state
         self.completed_tasks = self.db.get("completed_tasks", [])
         self.remaining_tasks = iter(tasks[len(self.completed_tasks) :])
         if self.db.get("gpg_key"):
@@ -284,7 +283,7 @@ def cd(path: str) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def supress_print():
+def supress_print() -> Generator[None, None, None]:
     print_func = builtins.print
     builtins.print = lambda *args, **kwargs: None
     yield
@@ -335,8 +334,10 @@ def check_ssh_connection(db: DbfilenameShelf) -> None:
 
 
 def check_buildbots(db: DbfilenameShelf) -> None:
-    async def _check():
-        async def _get_builder_status(buildbot_api, the_builder):
+    async def _check() -> set[Builder]:
+        async def _get_builder_status(
+            buildbot_api: BuildBotAPI, the_builder: Builder
+        ) -> tuple[Builder, bool]:
             return the_builder, await buildbot_api.is_builder_failing_currently(
                 the_builder
             )
@@ -416,13 +417,16 @@ def run_autoconf(db: DbfilenameShelf) -> None:
     regen_configure_sh = db["git_repo"] / "Tools/build/regen-configure.sh"
     if regen_configure_sh.exists():
         subprocess.check_call(
-            [regen_configure_sh], cwd=db["git_repo"],
+            [regen_configure_sh],
+            cwd=db["git_repo"],
         )
     # Python 3.11 and prior rely on autoconf built within a container
     # in order to maintain stability of autoconf generation.
     else:
         # Corresponds to the tag '269' and 'cp311'
-        cpython_autoconf_sha256 = "f370fee95eefa3d57b00488bce4911635411fa83e2d293ced8cf8a3674ead939"
+        cpython_autoconf_sha256 = (
+            "f370fee95eefa3d57b00488bce4911635411fa83e2d293ced8cf8a3674ead939"
+        )
         subprocess.check_call(
             [
                 "docker",
@@ -443,7 +447,7 @@ def run_autoconf(db: DbfilenameShelf) -> None:
 
 def check_pyspecific(db):
     with open(
-        db["git_repo"] / "Doc" / "tools" / "extensions" / "pyspecific.py", "r"
+        db["git_repo"] / "Doc" / "tools" / "extensions" / "pyspecific.py"
     ) as pyspecific:
         for line in pyspecific:
             if "SOURCE_URI =" in line:
@@ -476,7 +480,7 @@ def create_tag(db: DbfilenameShelf) -> None:
 def wait_for_source_and_docs_artifacts(db: DbfilenameShelf) -> None:
     # Determine if we need to wait for docs or only source artifacts.
     release_tag = db["release"]
-    should_wait_for_docs = release_tag.is_final or release_tag.is_release_candiate
+    should_wait_for_docs = release_tag.is_final or release_tag.is_release_candidate
 
     # Create the directory so it's easier to place the artifacts there.
     release_path = pathlib.Path(db["git_repo"] / str(release_tag))
@@ -485,25 +489,29 @@ def wait_for_source_and_docs_artifacts(db: DbfilenameShelf) -> None:
     # Build the list of filepaths we're expecting.
     wait_for_paths = [
         release_path / "src" / f"Python-{release_tag}.tgz",
-        release_path / "src" / f"Python-{release_tag}.tar.xz"
+        release_path / "src" / f"Python-{release_tag}.tar.xz",
     ]
     if should_wait_for_docs:
         docs_path = release_path / "docs"
-        wait_for_paths.extend([
-            docs_path / f"python-{release_tag}-docs.epub",
-            docs_path / f"python-{release_tag}-docs-html.tar.bz2",
-            docs_path / f"python-{release_tag}-docs-html.zip",
-            docs_path / f"python-{release_tag}-docs-pdf-a4.tar.bz2",
-            docs_path / f"python-{release_tag}-docs-pdf-a4.zip",
-            docs_path / f"python-{release_tag}-docs-pdf-letter.tar.bz2",
-            docs_path / f"python-{release_tag}-docs-pdf-letter.zip",
-            docs_path / f"python-{release_tag}-docs-texinfo.tar.bz2",
-            docs_path / f"python-{release_tag}-docs-texinfo.zip",
-            docs_path / f"python-{release_tag}-docs-text.tar.bz2",
-            docs_path / f"python-{release_tag}-docs-text.zip",
-        ])
+        wait_for_paths.extend(
+            [
+                docs_path / f"python-{release_tag}-docs.epub",
+                docs_path / f"python-{release_tag}-docs-html.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-html.zip",
+                docs_path / f"python-{release_tag}-docs-pdf-a4.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-pdf-a4.zip",
+                docs_path / f"python-{release_tag}-docs-pdf-letter.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-pdf-letter.zip",
+                docs_path / f"python-{release_tag}-docs-texinfo.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-texinfo.zip",
+                docs_path / f"python-{release_tag}-docs-text.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-text.zip",
+            ]
+        )
 
-    print(f"Waiting for source{' and docs' if should_wait_for_docs else ''} artifacts to be built")
+    print(
+        f"Waiting for source{' and docs' if should_wait_for_docs else ''} artifacts to be built"
+    )
     print(f"Artifacts should be placed at '{release_path}':")
     for path in wait_for_paths:
         print(f"- '{os.path.relpath(path, release_path)}'")
@@ -513,23 +521,32 @@ def wait_for_source_and_docs_artifacts(db: DbfilenameShelf) -> None:
 
 
 def sign_source_artifacts(db: DbfilenameShelf) -> None:
-    print('Signing tarballs with GPG')
+    print("Signing tarballs with GPG")
     uid = os.environ.get("GPG_KEY_FOR_RELEASE")
     if not uid:
-        print('List of available private keys:')
+        print("List of available private keys:")
         subprocess.check_call('gpg -K | grep -A 1 "^sec"', shell=True)
-        uid = input('Please enter key ID to use for signing: ')
+        uid = input("Please enter key ID to use for signing: ")
 
     tarballs_path = pathlib.Path(db["git_repo"] / str(db["release"]) / "src")
-    tgz = str(tarballs_path / ("Python-%s.tgz" % db["release"]))
-    xz = str(tarballs_path / ("Python-%s.tar.xz" % db["release"]))
+    tgz = str(tarballs_path / (f"Python-{db['release']}.tgz"))
+    xz = str(tarballs_path / (f"Python-{db['release']}.tar.xz"))
 
-    subprocess.check_call(['gpg', '-bas', '-u', uid, tgz])
-    subprocess.check_call(['gpg', '-bas', '-u', uid, xz])
+    subprocess.check_call(["gpg", "-bas", "-u", uid, tgz])
+    subprocess.check_call(["gpg", "-bas", "-u", uid, xz])
 
-    print('Signing tarballs with Sigstore')
-    subprocess.check_call(['python3', '-m', 'sigstore', 'sign',
-                           '--oidc-disable-ambient-providers', tgz, xz])
+    print("Signing tarballs with Sigstore")
+    subprocess.check_call(
+        [
+            "python3",
+            "-m",
+            "sigstore",
+            "sign",
+            "--oidc-disable-ambient-providers",
+            tgz,
+            xz,
+        ]
+    )
 
 
 def build_sbom_artifacts(db):
@@ -553,24 +570,24 @@ def build_sbom_artifacts(db):
 
 
 class MySFTPClient(paramiko.SFTPClient):
-    def put_dir(self, source, target, progress=None):
+    def put_dir(self, source: str, target: str, progress: Any = None) -> None:
         for item in os.listdir(source):
             if os.path.isfile(os.path.join(source, item)):
                 progress.text(item)
-                self.put(os.path.join(source, item), "%s/%s" % (target, item))
+                self.put(os.path.join(source, item), f"{target}/{item}")
                 progress()
             else:
-                self.mkdir("%s/%s" % (target, item), ignore_existing=True)
+                self.mkdir(f"{target}/{item}", ignore_existing=True)
                 self.put_dir(
                     os.path.join(source, item),
-                    "%s/%s" % (target, item),
+                    f"{target}/{item}",
                     progress=progress,
                 )
 
-    def mkdir(self, path, mode=511, ignore_existing=False):
+    def mkdir(self, path: str, mode: int = 511, ignore_existing: bool = False) -> None:
         try:
             super().mkdir(path, mode)
-        except IOError:
+        except OSError:
             if ignore_existing:
                 pass
             else:
@@ -595,7 +612,7 @@ def upload_files_to_server(db: DbfilenameShelf) -> None:
 
     shutil.rmtree(artifacts_path / f"Python-{db['release']}", ignore_errors=True)
 
-    def upload_subdir(subdir):
+    def upload_subdir(subdir: str) -> None:
         with contextlib.suppress(OSError):
             ftp_client.mkdir(str(destination / subdir))
         with alive_bar(len(tuple((artifacts_path / subdir).glob("**/*")))) as progress:
@@ -622,7 +639,7 @@ def place_files_in_download_folder(db: DbfilenameShelf) -> None:
     source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
     destination = f"/srv/www.python.org/ftp/python/{db['release'].normalized()}"
 
-    def execute_command(command):
+    def execute_command(command: str) -> None:
         channel = client.get_transport().open_session()
         channel.exec_command(command)
         if channel.recv_exit_status() != 0:
@@ -641,7 +658,7 @@ def place_files_in_download_folder(db: DbfilenameShelf) -> None:
         source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
         destination = f"/srv/www.python.org/ftp/python/doc/{release_tag}"
 
-        def execute_command(command):
+        def execute_command(command: str) -> None:
             channel = client.get_transport().open_session()
             channel.exec_command(command)
             if channel.recv_exit_status() != 0:
@@ -676,7 +693,7 @@ def upload_docs_to_the_docs_server(db: DbfilenameShelf) -> None:
 
     shutil.rmtree(artifacts_path / f"Python-{db['release']}", ignore_errors=True)
 
-    def upload_subdir(subdir):
+    def upload_subdir(subdir: str) -> None:
         with contextlib.suppress(OSError):
             ftp_client.mkdir(str(destination / subdir))
         with alive_bar(len(tuple((artifacts_path / subdir).glob("**/*")))) as progress:
@@ -705,7 +722,7 @@ def unpack_docs_in_the_docs_server(db: DbfilenameShelf) -> None:
     source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
     destination = f"/srv/docs.python.org/release/{release_tag}"
 
-    def execute_command(command):
+    def execute_command(command: str) -> None:
         channel = client.get_transport().open_session()
         channel.exec_command(command)
         if channel.recv_exit_status() != 0:
@@ -721,31 +738,49 @@ def unpack_docs_in_the_docs_server(db: DbfilenameShelf) -> None:
     execute_command(f"find {destination} -type f -exec chmod 664 {{}} \\;")
 
 
+def extract_github_owner(url: str) -> str:
+    if https_match := re.match(r"(https://)?github\.com/([^/]+)/", url):
+        return https_match.group(2)
+    elif ssh_match := re.match(r"^git@github\.com:([^/]+)/", url):
+        return ssh_match.group(1)
+    else:
+        raise ReleaseException(
+            f"Could not parse GitHub owner from 'origin' remote URL: {url}"
+        )
+
+
 def start_build_of_source_and_docs(db: DbfilenameShelf) -> None:
     # Get the git commit SHA for the tag
-    commit_sha = subprocess.check_output(
-        ["git", "rev-list", "-n", "1", db["release"].gitname],
-        cwd=db["git_repo"]
-    ).decode().strip()
+    commit_sha = (
+        subprocess.check_output(
+            ["git", "rev-list", "-n", "1", db["release"].gitname], cwd=db["git_repo"]
+        )
+        .decode()
+        .strip()
+    )
 
     # Get the owner of the GitHub repo (first path segment in a 'github.com' remote URL)
     # This works for both 'https' and 'ssh' style remote URLs.
-    origin_remote_url = subprocess.check_output(
-        ["git", "ls-remote", "--get-url", "origin"],
-        cwd=db["git_repo"]
-    ).decode().strip()
-    if https_match := re.match(r"github\.com/([^/]+)/", origin_remote_url):
-        origin_remote_github_owner = https_match.group(1)
-    elif ssh_match := re.match(r"^git@github\.com:([^/]+)/", origin_remote_url):
-        origin_remote_github_owner = ssh_match.group(1)
-    else:
-        raise ReleaseException(f"Could not parse GitHub owner from 'origin' remote URL: {origin_remote_url}")
+    origin_remote_url = (
+        subprocess.check_output(
+            ["git", "ls-remote", "--get-url", "origin"], cwd=db["git_repo"]
+        )
+        .decode()
+        .strip()
+    )
+    origin_remote_github_owner = extract_github_owner(origin_remote_url)
     # We ask for human verification at this point since this commit SHA is 'locked in'
     print()
-    print(f"Go to https://github.com/{origin_remote_github_owner}/cpython/commit/{commit_sha}")
-    print("- Ensure that there is no warning that the commit does not belong to this repository.")
+    print(
+        f"Go to https://github.com/{origin_remote_github_owner}/cpython/commit/{commit_sha}"
+    )
+    print(
+        "- Ensure that there is no warning that the commit does not belong to this repository."
+    )
     print("- Ensure that the commit diff does not contain any unexpected changes.")
-    print("- For the next step, ensure the commit SHA matches the one you verified on GitHub in this step.")
+    print(
+        "- For the next step, ensure the commit SHA matches the one you verified on GitHub in this step."
+    )
     print()
     if not ask_question(
         "Have you verified the release commit hasn't been tampered with on GitHub?"
@@ -755,16 +790,16 @@ def start_build_of_source_and_docs(db: DbfilenameShelf) -> None:
     # After visually confirming the release manager can start the build process
     # with the known good commit SHA.
     print()
-    print("Go to https://github.com/python/release-tools/actions/workflows/source-and-docs-release.yml")
+    print(
+        "Go to https://github.com/python/release-tools/actions/workflows/source-and-docs-release.yml"
+    )
     print("Select 'Run workflow' and enter the following values:")
     print(f"- Git remote to checkout: {origin_remote_github_owner}")
     print(f"- Git commit to target for the release: {commit_sha}")
     print(f"- CPython release number: {db['release']}")
     print()
 
-    if not ask_question(
-        "Have you started the source and docs build?"
-    ):
+    if not ask_question("Have you started the source and docs build?"):
         raise ReleaseException("Source and docs build must be started")
 
 
@@ -898,8 +933,6 @@ def modify_the_release_to_the_prerelease_pages(db: DbfilenameShelf) -> None:
 
 
 def post_release_merge(db: DbfilenameShelf) -> None:
-    release_tag: release_mod.Tag = db["release"]
-
     subprocess.check_call(
         ["git", "fetch", "--all"],
         cwd=db["git_repo"],
@@ -962,7 +995,7 @@ def maybe_prepare_new_main_branch(db: DbfilenameShelf) -> None:
 
     prev_branch = f"{release_tag.major}.{release_tag.minor}"
     new_branch = f"{release_tag.major}.{int(release_tag.minor)+1}"
-    whatsnew_file = f"Doc/whatsnew/{new_branch}"
+    whatsnew_file = f"Doc/whatsnew/{new_branch}.rst"
     with cd(db["git_repo"]), open(whatsnew_file, "w") as f:
         f.write(WHATS_NEW_TEMPLATE.format(version=new_branch, prev_version=prev_branch))
 
@@ -1003,7 +1036,7 @@ def is_mirror(repo: pathlib.Path, remote: str) -> bool:
 
 
 def push_to_local_fork(db: DbfilenameShelf) -> None:
-    def _push_to_local(dry_run=False):
+    def _push_to_local(dry_run: bool = False) -> None:
         git_command = ["git", "push"]
         if dry_run:
             git_command.append("--dry-run")
@@ -1014,7 +1047,8 @@ def push_to_local_fork(db: DbfilenameShelf) -> None:
             git_command += ["HEAD", "--tags"]
 
         subprocess.check_call(
-            git_command, cwd=db["git_repo"],
+            git_command,
+            cwd=db["git_repo"],
         )
 
     _push_to_local(dry_run=True)
@@ -1028,7 +1062,7 @@ def push_to_local_fork(db: DbfilenameShelf) -> None:
 def push_to_upstream(db: DbfilenameShelf) -> None:
     release_tag: release_mod.Tag = db["release"]
 
-    def _push_to_upstream(dry_run=False):
+    def _push_to_upstream(dry_run: bool = False) -> None:
         branch = f"{release_tag.major}.{release_tag.minor}"
         git_command = ["git", "push"]
         if dry_run:
@@ -1083,7 +1117,7 @@ fix these things in this script so it also support your platform.
 
     parser = argparse.ArgumentParser(description="Process some integers.")
 
-    def _release_type(release):
+    def _release_type(release: str) -> str:
         if not RELEASE_REGEXP.match(release):
             raise argparse.ArgumentTypeError("Invalid release string")
         return release
@@ -1103,7 +1137,7 @@ fix these things in this script so it also support your platform.
         type=str,
     )
 
-    def _api_key(api_key):
+    def _api_key(api_key: str) -> str:
         if not API_KEY_REGEXP.match(api_key):
             raise argparse.ArgumentTypeError(
                 "Invalid api key format. It must be on the form USER:API_KEY"
@@ -1140,19 +1174,26 @@ fix these things in this script so it also support your platform.
         Task(run_blurb_release, "Run blurb release"),
         Task(check_cpython_repo_is_clean, "Checking git repository is clean"),
         Task(prepare_pydoc_topics, "Preparing pydoc topics"),
+        Task(bump_version, "Bump version"),
+        Task(check_cpython_repo_is_clean, "Checking git repository is clean"),
         Task(run_autoconf, "Running autoconf"),
         Task(check_cpython_repo_is_clean, "Checking git repository is clean"),
         Task(check_pyspecific, "Checking pyspecific"),
-        Task(bump_version, "Bump version"),
         Task(check_cpython_repo_is_clean, "Checking git repository is clean"),
         Task(create_tag, "Create tag"),
         Task(push_to_local_fork, "Push new tags and branches to private fork"),
-        Task(start_build_of_source_and_docs, "Start the builds for source and docs artifacts"),
+        Task(
+            start_build_of_source_and_docs,
+            "Start the builds for source and docs artifacts",
+        ),
         Task(
             send_email_to_platform_release_managers,
             "Platform release managers have been notified of the commit SHA",
         ),
-        Task(wait_for_source_and_docs_artifacts, "Wait for source and docs artifacts to build"),
+        Task(
+            wait_for_source_and_docs_artifacts,
+            "Wait for source and docs artifacts to build",
+        ),
         Task(build_sbom_artifacts, "Building SBOM artifacts"),
         Task(sign_source_artifacts, "Sign source artifacts"),
         Task(upload_files_to_server, "Upload files to the PSF server"),
